@@ -46,7 +46,7 @@ SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
 
 # DATA PROCESSING
-GAP_MULTIPLIER = 4.0  # Gaps > interval * this value trigger NaN insertion
+GAP_MULTIPLIER = 20.0  # Increased to prevent line breakage when switching from slow to fast intervals
 CHANNEL_NAME_TEMPLATE = "Ch_{}"  # Use .format(i+1) for channel names
 
 # SLIDER RANGE (logarithmic scale)
@@ -323,6 +323,201 @@ DEVICE_DRIVERS = {
 }
 
 # ==========================================
+#        EXPORT HANDLER
+# ==========================================
+class ExportHandler:
+    @staticmethod
+    def show_dialog(parent, x_limits, ch_vars):
+        if not EXPORT_AVAILABLE:
+             messagebox.showerror("Error", "pandas/openpyxl missing. Install with pip.")
+             return
+
+        top = tk.Toplevel(parent)
+        top.title("Export View Data")
+        top.geometry("500x500") 
+        top.configure(bg=COLOR_BG)
+        c_frame = ttk.Frame(top, padding=20)
+        c_frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(c_frame, text="Export Settings", font=FONT_HEADER).pack(pady=(0,10))
+        
+        ch_frame = ttk.LabelFrame(c_frame, text="Select Channels to Export", padding=10)
+        ch_frame.pack(fill=tk.X, pady=10)
+        
+        export_vars = []
+        for i in range(MAX_CHANNELS):
+            is_active = ch_vars['active'][i].get()
+            var = tk.BooleanVar(value=is_active)
+            export_vars.append(var)
+            col = i % 2
+            row = i // 2
+            ttk.Checkbutton(ch_frame, text=f"Channel {i+1}", variable=var).grid(row=row, column=col, sticky="w", padx=10, pady=2)
+
+        x_min, x_max = x_limits
+        try:
+            start_dt = mdates.num2date(x_min).replace(tzinfo=None) 
+            end_dt = mdates.num2date(x_max).replace(tzinfo=None)
+        except:
+            start_dt = datetime.now() - timedelta(hours=1)
+            end_dt = datetime.now()
+
+        ttk.Label(c_frame, text="Start Time (YYYY-MM-DD HH:MM):").pack(anchor="w")
+        s_entry = ttk.Entry(c_frame, width=30)
+        s_entry.insert(0, start_dt.strftime("%Y-%m-%d %H:%M"))
+        s_entry.pack(fill=tk.X, pady=(5, 5))
+        
+        ttk.Label(c_frame, text="End Time (YYYY-MM-DD HH:MM):").pack(anchor="w")
+        e_entry = ttk.Entry(c_frame, width=30)
+        e_entry.insert(0, end_dt.strftime("%Y-%m-%d %H:%M"))
+        e_entry.pack(fill=tk.X, pady=(5, 20))
+        
+        def run_export_thread():
+            try:
+                s_d = datetime.strptime(s_entry.get(), "%Y-%m-%d %H:%M")
+                e_d = datetime.strptime(e_entry.get(), "%Y-%m-%d %H:%M")
+                if s_d >= e_d:
+                    messagebox.showerror("Error", "Start time must be before end time.")
+                    return
+                
+                sel_chs = [v.get() for v in export_vars]
+                
+                # Capture current channel settings (Factors, Offsets, Colors) to pass to thread safely
+                factors = [ch_vars['factor'][i].get() for i in range(MAX_CHANNELS)]
+                offsets = [ch_vars['offset'][i].get() for i in range(MAX_CHANNELS)]
+                colors = [ch_vars['colors'][i] for i in range(MAX_CHANNELS)]
+                
+                out = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")], initialfile=f"export.xlsx")
+                if not out: return
+
+                # UI Feedback
+                btn_go.config(text="Processing... (Please Wait)", state="disabled")
+                
+                # Start Thread
+                threading.Thread(target=ExportHandler.process_thread, args=(s_d, e_d, sel_chs, factors, offsets, colors, out, top, parent), daemon=True).start()
+                
+            except ValueError: 
+                messagebox.showerror("Format Error", "Invalid Date Format.\nUse: YYYY-MM-DD HH:MM")
+
+        btn_go = ttk.Button(c_frame, text="Export Now", command=run_export_thread)
+        btn_go.pack(fill=tk.X, pady=10)
+
+    @staticmethod
+    def process_thread(start_dt, end_dt, channels_to_export, factors, offsets, colors, out_path, popup, parent):
+        """Heavy lifting for export in a separate thread."""
+        try: 
+            import pandas as pd
+            from openpyxl.utils import get_column_letter
+            from openpyxl.styles import PatternFill, Font
+            
+            all_logs = glob.glob("log_*.csv")
+            relevant_files = []
+            req_start_date = start_dt.date()
+            req_end_date = end_dt.date()
+
+            for log in all_logs:
+                try:
+                    date_str = log.replace("log_", "").replace(".csv", "")
+                    file_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                    if req_start_date <= file_date <= req_end_date:
+                        relevant_files.append(log)
+                except: continue 
+            relevant_files.sort()
+            
+            if not relevant_files:
+                parent.after(0, lambda: messagebox.showwarning("Empty", "No log files found."))
+                parent.after(0, popup.destroy)
+                return
+
+            combined = []
+            start_ts = start_dt.timestamp()
+            end_ts = end_dt.timestamp()
+
+            for log in relevant_files:
+                try:
+                    chunk_iter = pd.read_csv(log, comment='#', on_bad_lines='skip', chunksize=10000)
+                    for chunk in chunk_iter:
+                        if 'Timestamp_Unix' not in chunk.columns: continue
+                        mask = (chunk['Timestamp_Unix'] >= start_ts) & (chunk['Timestamp_Unix'] <= end_ts)
+                        filtered = chunk.loc[mask]
+                        if not filtered.empty:
+                            if 'Timestamp_ISO' in filtered.columns: 
+                                final = filtered.drop(columns=['Timestamp_Unix'])
+                            else:
+                                filtered['Timestamp'] = pd.to_datetime(filtered['Timestamp_Unix'], unit='s')
+                                final = filtered.drop(columns=['Timestamp_Unix'])
+                            combined.append(final)
+                except Exception as e: 
+                    print(f"Skipping bad file/chunk: {e}")
+
+            if combined:
+                full_df = pd.concat(combined, ignore_index=True)
+                rename_map = {CHANNEL_NAME_TEMPLATE.format(i+1): f"Raw_{CHANNEL_NAME_TEMPLATE.format(i+1)}" for i in range(MAX_CHANNELS)}
+                full_df.rename(columns=rename_map, inplace=True)
+                
+                # Filter cols
+                for i in range(MAX_CHANNELS):
+                    if not channels_to_export[i]:
+                        col_name = f"Raw_{CHANNEL_NAME_TEMPLATE.format(i+1)}"
+                        if col_name in full_df.columns: full_df.drop(columns=[col_name], inplace=True)
+
+                # Add calc placeholders
+                for i in range(MAX_CHANNELS):
+                    if channels_to_export[i]: full_df[f"Cal_{CHANNEL_NAME_TEMPLATE.format(i+1)}"] = "" 
+
+                # Write Excel
+                with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+                    full_df.to_excel(writer, index=False, startrow=3)
+                
+                # Formatting
+                wb = openpyxl.load_workbook(out_path)
+                ws = wb.active
+                ws['A2'] = "Factor"; ws['A3'] = "Offset"
+                ws['A2'].font = Font(bold=True); ws['A3'].font = Font(bold=True)
+
+                header_row = 4
+                col_map = {}
+                for cell in ws[header_row]:
+                    if cell.value:
+                        col_map[cell.value] = get_column_letter(cell.column)
+                        ws.column_dimensions[get_column_letter(cell.column)].width = 18 
+                
+                max_row = ws.max_row
+                
+                # Formula Injection
+                for i in range(MAX_CHANNELS):
+                    if not channels_to_export[i]: continue
+                    raw_col = f"Raw_{CHANNEL_NAME_TEMPLATE.format(i+1)}"
+                    cal_col = f"Cal_{CHANNEL_NAME_TEMPLATE.format(i+1)}"
+                    
+                    if raw_col in col_map and cal_col in col_map:
+                        r_let = col_map[raw_col]
+                        c_let = col_map[cal_col]
+                        
+                        f_val = factors[i]
+                        o_val = offsets[i]
+                        
+                        ws[f"{c_let}2"] = f_val
+                        ws[f"{c_let}3"] = o_val
+                        
+                        for row in range(5, max_row + 1):
+                            ws[f"{c_let}{row}"] = f"={r_let}{row}*{c_let}$2+{c_let}$3"
+                            
+                        hex_color = colors[i].replace('#', '')
+                        fill = PatternFill(start_color="FF"+hex_color, end_color="FF"+hex_color, fill_type="solid")
+                        ws[f"{c_let}{header_row}"].fill = fill
+
+                wb.save(out_path)
+                parent.after(0, lambda: messagebox.showinfo("Success", f"Exported to {os.path.basename(out_path)}"))
+                parent.after(0, popup.destroy)
+            else: 
+                parent.after(0, lambda: messagebox.showwarning("Empty", "No data in range."))
+                parent.after(0, popup.destroy)
+                
+        except Exception as e: 
+            parent.after(0, lambda: messagebox.showerror("Export Error", str(e)))
+            parent.after(0, popup.destroy)
+
+# ==========================================
 #              MAIN APPLICATION
 # ==========================================
 
@@ -388,30 +583,22 @@ class CustomToolbar(NavigationToolbar2Tk):
         self.lbl_lock_status.pack(side=tk.LEFT, padx=10)
         ToolTip(self.lbl_lock_status, "Auto-Scroll: Active")
 
-        # Create buttons with modern styling
-        self.btn_home = tk.Button(self.frame_right, text="🏠", command=self.home, **self.btn_style_normal)
-        self.btn_home.pack(side=tk.LEFT, padx=3, pady=4)
-        ToolTip(self.btn_home, "Reset View (Home)")
+        # Define buttons structure: (AttributeName, Label, Command, Tooltip)
+        buttons_config = [
+            ("btn_home", "🏠", self.home, "Reset View (Home)"),
+            ("btn_pan", "✋", self.pan, "Pan Mode"),
+            ("btn_zoom", "🔍", self.zoom, "Zoom Mode"),
+            ("btn_save", "💾", self.save_figure, "Save Screenshot"),
+            ("btn_pause", "⏸", self.toggle_pause, "Pause/Resume"),
+            ("btn_export", "📊", self.app.open_export_window, "Export Data")
+        ]
 
-        self.btn_pan = tk.Button(self.frame_right, text="✋", command=self.pan, **self.btn_style_normal)
-        self.btn_pan.pack(side=tk.LEFT, padx=3, pady=4)
-        ToolTip(self.btn_pan, "Pan Mode")
-
-        self.btn_zoom = tk.Button(self.frame_right, text="🔍", command=self.zoom, **self.btn_style_normal)
-        self.btn_zoom.pack(side=tk.LEFT, padx=3, pady=4)
-        ToolTip(self.btn_zoom, "Zoom Mode")
-
-        self.btn_save = tk.Button(self.frame_right, text="💾", command=self.save_figure, **self.btn_style_normal)
-        self.btn_save.pack(side=tk.LEFT, padx=3, pady=4)
-        ToolTip(self.btn_save, "Save Screenshot")
-
-        self.btn_pause = tk.Button(self.frame_right, text="⏸", command=self.toggle_pause, **self.btn_style_normal)
-        self.btn_pause.pack(side=tk.LEFT, padx=3, pady=4)
-        ToolTip(self.btn_pause, "Pause/Resume")
-
-        self.btn_export = tk.Button(self.frame_right, text="📊", command=self.app.open_export_window, **self.btn_style_normal)
-        self.btn_export.pack(side=tk.LEFT, padx=3, pady=4)
-        ToolTip(self.btn_export, "Export Data")
+        # Generate buttons in loop and assign to self
+        for attr, text, cmd, tooltip in buttons_config:
+            btn = tk.Button(self.frame_right, text=text, command=cmd, **self.btn_style_normal)
+            btn.pack(side=tk.LEFT, padx=3, pady=4)
+            ToolTip(btn, tooltip)
+            setattr(self, attr, btn) # Store explicitly so other methods can access self.btn_pan etc.
 
     def home(self, *args):
         # Reset Y-axis to UI box values, keep current slider, enable live mode
@@ -495,7 +682,7 @@ class CustomToolbar(NavigationToolbar2Tk):
 class SensorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Pro Logger v4.1 - 24h View (Pan Friendly)")
+        self.root.title("Pyrec Data 0.9 beta")
         self.root.geometry("1280x850")
         self.root.configure(bg=COLOR_BG)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -875,6 +1062,10 @@ class SensorApp:
         self.lbl_window_display.config(text=self.format_time_window(window_sec))
         
         if self.auto_scroll.get():
+            # Force immediate update of the view without waiting for animation tick
+            if self.timestamps:
+                self._render_plot()
+                self.canvas.draw_idle()
             return
 
         # PAN/ZOOM MODE LOGIC
@@ -925,190 +1116,8 @@ class SensorApp:
 
     # --- EXPORT LOGIC (THREADED) ---
     def open_export_window(self):
-        if not EXPORT_AVAILABLE:
-             messagebox.showerror("Error", "pandas/openpyxl missing. Install with pip.")
-             return
+        ExportHandler.show_dialog(self.root, self.ax.get_xlim(), self.ch_vars)
 
-        top = tk.Toplevel(self.root)
-        top.title("Export View Data")
-        top.geometry("500x500") 
-        top.configure(bg=COLOR_BG)
-        c_frame = ttk.Frame(top, padding=20)
-        c_frame.pack(fill=tk.BOTH, expand=True)
-        
-        ttk.Label(c_frame, text="Export Settings", font=FONT_HEADER).pack(pady=(0,10))
-        
-        ch_frame = ttk.LabelFrame(c_frame, text="Select Channels to Export", padding=10)
-        ch_frame.pack(fill=tk.X, pady=10)
-        
-        export_vars = []
-        for i in range(MAX_CHANNELS):
-            is_active = self.ch_vars['active'][i].get()
-            var = tk.BooleanVar(value=is_active)
-            export_vars.append(var)
-            col = i % 2
-            row = i // 2
-            ttk.Checkbutton(ch_frame, text=f"Channel {i+1}", variable=var).grid(row=row, column=col, sticky="w", padx=10, pady=2)
-
-        x_min, x_max = self.ax.get_xlim()
-        try:
-            start_dt = mdates.num2date(x_min).replace(tzinfo=None) 
-            end_dt = mdates.num2date(x_max).replace(tzinfo=None)
-        except:
-            start_dt = datetime.now() - timedelta(hours=1)
-            end_dt = datetime.now()
-
-        ttk.Label(c_frame, text="Start Time (YYYY-MM-DD HH:MM):").pack(anchor="w")
-        s_entry = ttk.Entry(c_frame, width=30)
-        s_entry.insert(0, start_dt.strftime("%Y-%m-%d %H:%M"))
-        s_entry.pack(fill=tk.X, pady=(5, 5))
-        
-        ttk.Label(c_frame, text="End Time (YYYY-MM-DD HH:MM):").pack(anchor="w")
-        e_entry = ttk.Entry(c_frame, width=30)
-        e_entry.insert(0, end_dt.strftime("%Y-%m-%d %H:%M"))
-        e_entry.pack(fill=tk.X, pady=(5, 20))
-        
-        def run_export_thread():
-            try:
-                s_d = datetime.strptime(s_entry.get(), "%Y-%m-%d %H:%M")
-                e_d = datetime.strptime(e_entry.get(), "%Y-%m-%d %H:%M")
-                if s_d >= e_d:
-                    messagebox.showerror("Error", "Start time must be before end time.")
-                    return
-                
-                sel_chs = [v.get() for v in export_vars]
-                
-                out = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")], initialfile=f"export.xlsx")
-                if not out: return
-
-                # UI Feedback
-                btn_go.config(text="Processing... (Please Wait)", state="disabled")
-                
-                # Start Thread
-                threading.Thread(target=self.process_export_thread, args=(s_d, e_d, sel_chs, out, top), daemon=True).start()
-                
-            except ValueError: 
-                messagebox.showerror("Format Error", "Invalid Date Format.\nUse: YYYY-MM-DD HH:MM")
-
-        btn_go = ttk.Button(c_frame, text="Export Now", command=run_export_thread)
-        btn_go.pack(fill=tk.X, pady=10)
-
-    def process_export_thread(self, start_dt, end_dt, channels_to_export, out_path, popup):
-        """Heavy lifting for export in a separate thread."""
-        try: 
-            import pandas as pd
-            from openpyxl.utils import get_column_letter
-            from openpyxl.styles import PatternFill, Font
-            
-            all_logs = glob.glob("log_*.csv")
-            relevant_files = []
-            req_start_date = start_dt.date()
-            req_end_date = end_dt.date()
-
-            for log in all_logs:
-                try:
-                    date_str = log.replace("log_", "").replace(".csv", "")
-                    file_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    if req_start_date <= file_date <= req_end_date:
-                        relevant_files.append(log)
-                except: continue 
-            relevant_files.sort()
-            
-            if not relevant_files:
-                self.root.after(0, lambda: messagebox.showwarning("Empty", "No log files found."))
-                self.root.after(0, popup.destroy)
-                return
-
-            combined = []
-            start_ts = start_dt.timestamp()
-            end_ts = end_dt.timestamp()
-
-            for log in relevant_files:
-                try:
-                    chunk_iter = pd.read_csv(log, comment='#', on_bad_lines='skip', chunksize=10000)
-                    for chunk in chunk_iter:
-                        if 'Timestamp_Unix' not in chunk.columns: continue
-                        mask = (chunk['Timestamp_Unix'] >= start_ts) & (chunk['Timestamp_Unix'] <= end_ts)
-                        filtered = chunk.loc[mask]
-                        if not filtered.empty:
-                            if 'Timestamp_ISO' in filtered.columns: 
-                                final = filtered.drop(columns=['Timestamp_Unix'])
-                            else:
-                                filtered['Timestamp'] = pd.to_datetime(filtered['Timestamp_Unix'], unit='s')
-                                final = filtered.drop(columns=['Timestamp_Unix'])
-                            combined.append(final)
-                except Exception as e: 
-                    print(f"Skipping bad file/chunk: {e}")
-
-            if combined:
-                full_df = pd.concat(combined, ignore_index=True)
-                rename_map = {CHANNEL_NAME_TEMPLATE.format(i+1): f"Raw_{CHANNEL_NAME_TEMPLATE.format(i+1)}" for i in range(MAX_CHANNELS)}
-                full_df.rename(columns=rename_map, inplace=True)
-                
-                # Filter cols
-                for i in range(MAX_CHANNELS):
-                    if not channels_to_export[i]:
-                        col_name = f"Raw_{CHANNEL_NAME_TEMPLATE.format(i+1)}"
-                        if col_name in full_df.columns: full_df.drop(columns=[col_name], inplace=True)
-
-                # Add calc placeholders
-                for i in range(MAX_CHANNELS):
-                    if channels_to_export[i]: full_df[f"Cal_{CHANNEL_NAME_TEMPLATE.format(i+1)}"] = "" 
-
-                # Write Excel
-                with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
-                    full_df.to_excel(writer, index=False, startrow=3)
-                
-                # Formatting
-                wb = openpyxl.load_workbook(out_path)
-                ws = wb.active
-                ws['A2'] = "Factor"; ws['A3'] = "Offset"
-                ws['A2'].font = Font(bold=True); ws['A3'].font = Font(bold=True)
-
-                header_row = 4
-                col_map = {}
-                for cell in ws[header_row]:
-                    if cell.value:
-                        col_map[cell.value] = get_column_letter(cell.column)
-                        ws.column_dimensions[get_column_letter(cell.column)].width = 18 
-                
-                max_row = ws.max_row
-                
-                # Formula Injection
-                for i in range(MAX_CHANNELS):
-                    if not channels_to_export[i]: continue
-                    raw_col = f"Raw_{CHANNEL_NAME_TEMPLATE.format(i+1)}"
-                    cal_col = f"Cal_{CHANNEL_NAME_TEMPLATE.format(i+1)}"
-                    
-                    if raw_col in col_map and cal_col in col_map:
-                        r_let = col_map[raw_col]
-                        c_let = col_map[cal_col]
-                        
-                        # Use root.after to safely get Tk vars from main thread if strict
-                        # but reading vars is generally safe.
-                        f_val = self.ch_vars['factor'][i].get()
-                        o_val = self.ch_vars['offset'][i].get()
-                        
-                        ws[f"{c_let}2"] = f_val
-                        ws[f"{c_let}3"] = o_val
-                        
-                        for row in range(5, max_row + 1):
-                            ws[f"{c_let}{row}"] = f"={r_let}{row}*{c_let}$2+{c_let}$3"
-                            
-                        hex_color = self.ch_vars['colors'][i].replace('#', '')
-                        fill = PatternFill(start_color="FF"+hex_color, end_color="FF"+hex_color, fill_type="solid")
-                        ws[f"{c_let}{header_row}"].fill = fill
-
-                wb.save(out_path)
-                self.root.after(0, lambda: messagebox.showinfo("Success", f"Exported to {os.path.basename(out_path)}"))
-                self.root.after(0, popup.destroy)
-            else: 
-                self.root.after(0, lambda: messagebox.showwarning("Empty", "No data in range."))
-                self.root.after(0, popup.destroy)
-                
-        except Exception as e: 
-            self.root.after(0, lambda: messagebox.showerror("Export Error", str(e)))
-            self.root.after(0, popup.destroy)
     def load_settings(self):
         if not os.path.exists(INI_FILE): return
         config = configparser.ConfigParser()
@@ -1124,6 +1133,11 @@ class SensorApp:
                 self.y_max.set(config['Graph'].getfloat('y_max', 4.5))
                 iv = config['Graph'].get('interval', '1s')
                 self.interval_var.set(iv)
+                
+                # Update the actual internal timer to match the loaded setting
+                if iv in INTERVAL_OPTIONS:
+                    self.current_interval_sec = INTERVAL_OPTIONS[iv]
+
                 # Let on_device_changed handle the logic for restricted intervals
             for i in range(MAX_CHANNELS):
                 sect = f'Channel_{i}'
@@ -1202,6 +1216,33 @@ class SensorApp:
         if self.csv_writer:
             self.log_queue.put(row)
 
+    def _compute_gap_blueprint(self, raw_dates: list, step: int) -> tuple[list, list]:
+        """
+        Detects time gaps in data and creates a 'blueprint' for inserting NaNs.
+        Returns:
+            final_dt: List of datetimes including gap timestamps.
+            indices: List of (index, is_gap) tuples to reconstruct Y-values.
+        """
+        gap_threshold = timedelta(seconds=self.current_interval_sec * step * GAP_MULTIPLIER)
+        expanded_indices = []
+        final_dt = []
+        
+        if raw_dates:
+            expanded_indices.append((0, False))
+            for i in range(1, len(raw_dates)):
+                diff = raw_dates[i] - raw_dates[i-1]
+                if diff > gap_threshold:
+                    expanded_indices.append((i, True))  # Mark gap
+                expanded_indices.append((i, False))  # Mark data
+
+            for idx, is_gap in expanded_indices:
+                if is_gap:
+                    final_dt.append(raw_dates[idx-1]) # Use prev time for gap start
+                else:
+                    final_dt.append(raw_dates[idx])
+                    
+        return final_dt, expanded_indices
+
     def _render_plot(self) -> list:
         """Slice, downsample, and render data to plot lines. Returns line artists."""
         if not self.timestamps:
@@ -1217,6 +1258,7 @@ class SensorApp:
         total_points = len(self.timestamps)
         render_start = 0
         render_end = total_points
+        view_min_dt = None
 
         if self.auto_scroll.get():
             # AUTO SCROLL MODE: Show data from the past N seconds (from slider)
@@ -1225,6 +1267,7 @@ class SensorApp:
             if self.timestamps:
                 latest_ts = self.timestamps[-1]
                 cutoff_ts = latest_ts - window_seconds
+                view_min_dt = datetime.fromtimestamp(cutoff_ts)
                 
                 # Use cached list if size hasn't changed
                 current_size = len(self.timestamps)
@@ -1286,25 +1329,8 @@ class SensorApp:
         # --- SLICING & DRAWING ---
         slice_dt_raw = list(itertools.islice(self.datetime_cache, render_start, render_end, step))
         
-        # GAP DETECTION & CORRECTION
-        gap_threshold = timedelta(seconds=self.current_interval_sec * step * GAP_MULTIPLIER)
-        expanded_indices: list[tuple[int, bool]] = []
-        
-        if slice_dt_raw:
-            expanded_indices.append((0, False))
-            for i in range(1, len(slice_dt_raw)):
-                diff = slice_dt_raw[i] - slice_dt_raw[i-1]
-                if diff > gap_threshold:
-                    expanded_indices.append((i, True))  # Insert NaN
-                expanded_indices.append((i, False))  # Insert Real Data
-
-        # Build final_dt based on blueprint
-        final_dt: list[datetime] = []
-        for idx, is_gap in expanded_indices:
-            if is_gap:
-                final_dt.append(slice_dt_raw[idx-1])
-            else:
-                final_dt.append(slice_dt_raw[idx])
+        # Helper Call to generate blueprint
+        final_dt, expanded_indices = self._compute_gap_blueprint(slice_dt_raw, step)
         
         for i, line in enumerate(self.lines):
             if self.ch_vars['active'][i].get():
@@ -1313,7 +1339,7 @@ class SensorApp:
                 f = self.ch_vars['factor'][i].get()
                 o = self.ch_vars['offset'][i].get()
                 
-                # Reconstruct with gaps
+                # Reconstruct with gaps using blueprint
                 calc_slice: list[float] = []
                 for idx, is_gap in expanded_indices:
                     if is_gap:
@@ -1334,7 +1360,10 @@ class SensorApp:
         if self.auto_scroll.get() and final_dt:
             # Use actual latest timestamp (not downsampled) to avoid edge artifacts
             actual_latest_dt = self.datetime_cache[-1] if self.datetime_cache else final_dt[-1]
-            self.ax.set_xlim(final_dt[0], actual_latest_dt)
+            
+            # Use calculated view start (smooth) if available, otherwise snap to data (old behavior)
+            start_limit = view_min_dt if view_min_dt else final_dt[0]
+            self.ax.set_xlim(start_limit, actual_latest_dt)
         
         return self.lines
 
